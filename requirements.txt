@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+psycopg2-binary     # for Postgres on Railway
+python-multipart    # harmless; useful if you add file endpoints later
