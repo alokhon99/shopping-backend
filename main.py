@@ -13,38 +13,30 @@ from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 
 # -------------------- Config --------------------
 DB_URL = os.getenv("DB_URL", "sqlite:///./shopping.db")
-ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
-from sqlalchemy import event
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
 
 def make_engine(url: str):
     if url.startswith("sqlite"):
         eng = create_engine(url, connect_args={"check_same_thread": False})
         @event.listens_for(eng, "connect")
-        def set_sqlite_pragma(dbapi_connection, connection_record):
+        def _fk_on(dbapi_connection, connection_record):
             cur = dbapi_connection.cursor()
             cur.execute("PRAGMA foreign_keys=ON")
             cur.close()
         return eng
     else:
+        # Render'da Postgres uchun
         return create_engine(url, pool_pre_ping=True)
 
 engine = make_engine(DB_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 Base = declarative_base()
 
-# Enforce FK in SQLite (extra safety; we also guard in code)
-if DB_URL.startswith("sqlite"):
-    @event.listens_for(engine, "connect")
-    def set_sqlite_pragma(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-app = FastAPI(title="Shopping List Backend", version="1.1.0")
+app = FastAPI(title="Shopping List Backend", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=ALLOWED_ORIGINS or ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -55,9 +47,7 @@ class ProductGroup(Base):
     __tablename__ = "product_groups"
     id = Column(Integer, primary_key=True)
     name = Column(String(120), nullable=False)
-
     products = relationship("Product", back_populates="group", cascade="all, delete")
-
 
 class Product(Base):
     __tablename__ = "products"
@@ -66,9 +56,7 @@ class Product(Base):
     name = Column(String(200), nullable=False)
     description = Column(Text, default="")
     default_unit = Column(String(32), default="pcs")
-
     group = relationship("ProductGroup", back_populates="products")
-
 
 class ShoppingList(Base):
     __tablename__ = "shopping_lists"
@@ -78,9 +66,7 @@ class ShoppingList(Base):
     shopping_date = Column(Date, nullable=True)
     status = Column(String(16), default="active")  # active|completed
     created_at = Column(DateTime, default=datetime.utcnow)
-
     items = relationship("ShoppingListItem", back_populates="list", cascade="all, delete")
-
 
 class ShoppingListItem(Base):
     __tablename__ = "shopping_list_items"
@@ -90,7 +76,6 @@ class ShoppingListItem(Base):
     quantity = Column(Integer, nullable=False, default=1)
     unit = Column(String(32), default="pcs")
     purchased = Column(Boolean, default=False)
-
     list = relationship("ShoppingList", back_populates="items")
     product = relationship("Product")
 
@@ -101,7 +86,7 @@ class ProductOut(BaseModel):
     name: str
     description: str
     default_unit: str
-    class Config: from_attributes = True
+    class Config: from_attributes = True  # if Pydantic v2, it's still supported by FastAPI
 
 class ProductGroupOut(BaseModel):
     id: int
@@ -169,11 +154,6 @@ def get_db():
         db.close()
 
 def get_user_id(x_user_id: Optional[str] = Header(default=None)):
-    """
-    For now, we take the user id from an HTTP header `x-user-id`.
-    In Telegram WebApp, you can parse tg.initDataUnsafe.user.id on the frontend and pass it here.
-    Later we can verify initData signature if needed.
-    """
     if not x_user_id:
         raise HTTPException(status_code=400, detail="Missing x-user-id header")
     return x_user_id
@@ -194,10 +174,17 @@ def list_products(
         stmt = stmt.where(Product.group_id == group_id)
     if q:
         like = f"%{q.strip()}%"
-        stmt = stmt.where(
-            func.lower(Product.name).like(func.lower(like)) |
-            func.lower(Product.description).like(func.lower(like))
-        )
+        if DB_URL.startswith("postgresql"):
+            # Native case-insensitive match on Postgres
+            stmt = stmt.where(
+                Product.name.ilike(like) | Product.description.ilike(like)
+            )
+        else:
+            # Portable fallback (SQLite): lower both sides
+            stmt = stmt.where(
+                func.lower(Product.name).like(like.lower()) |
+                func.lower(Product.description).like(like.lower())
+            )
     return db.execute(stmt.order_by(Product.id.desc())).scalars().all()
 
 # -------------------- Admin: Product Groups --------------------
@@ -231,7 +218,6 @@ def delete_group(group_id: int, db: Session = Depends(get_db)):
     g = db.get(ProductGroup, group_id)
     if not g:
         raise HTTPException(status_code=404, detail="Group not found")
-
     product_ids = [p.id for p in g.products]
     if product_ids:
         used = db.execute(
@@ -242,7 +228,6 @@ def delete_group(group_id: int, db: Session = Depends(get_db)):
                 status_code=400,
                 detail="Cannot delete group: some products are used in shopping lists"
             )
-
     db.delete(g)
     db.commit()
     return
@@ -253,7 +238,6 @@ def create_product(payload: ProductCreate, db: Session = Depends(get_db)):
     group = db.get(ProductGroup, payload.group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
-
     p = Product(
         group_id=payload.group_id,
         name=payload.name.strip(),
@@ -272,26 +256,21 @@ def patch_product(product_id: int, payload: ProductPatch, db: Session = Depends(
     p = db.get(Product, product_id)
     if not p:
         raise HTTPException(status_code=404, detail="Product not found")
-
     if payload.group_id is not None:
         group = db.get(ProductGroup, payload.group_id)
         if not group:
             raise HTTPException(status_code=404, detail="Target group not found")
         p.group_id = payload.group_id
-
     if payload.name is not None:
         name = payload.name.strip()
         if not name:
             raise HTTPException(status_code=400, detail="Name cannot be empty")
         p.name = name
-
     if payload.description is not None:
         p.description = (payload.description or "").strip()
-
     if payload.default_unit is not None:
         unit = (payload.default_unit or "").strip() or "pcs"
         p.default_unit = unit
-
     db.commit()
     db.refresh(p)
     return p
@@ -301,7 +280,6 @@ def delete_product(product_id: int, db: Session = Depends(get_db)):
     p = db.get(Product, product_id)
     if not p:
         raise HTTPException(status_code=404, detail="Product not found")
-
     used = db.execute(
         select(ShoppingListItem).where(ShoppingListItem.product_id == product_id)
     ).first()
@@ -310,7 +288,6 @@ def delete_product(product_id: int, db: Session = Depends(get_db)):
             status_code=400,
             detail="Cannot delete product: it is used in shopping lists"
         )
-
     db.delete(p)
     db.commit()
     return
@@ -320,7 +297,6 @@ def delete_product(product_id: int, db: Session = Depends(get_db)):
 def create_list(payload: ShoppingListCreate, user_id: str = Depends(get_user_id), db: Session = Depends(get_db)):
     if not payload.items:
         raise HTTPException(status_code=400, detail="List must contain at least one item")
-
     sl = ShoppingList(
         user_id=user_id,
         name=payload.name.strip(),
@@ -329,12 +305,10 @@ def create_list(payload: ShoppingListCreate, user_id: str = Depends(get_user_id)
     )
     db.add(sl)
     db.flush()
-
     for it in payload.items:
         product = db.get(Product, it.product_id)
         if not product:
             raise HTTPException(status_code=404, detail=f"Product {it.product_id} not found")
-
         unit = it.unit or product.default_unit
         db.add(ShoppingListItem(
             list_id=sl.id,
@@ -343,7 +317,6 @@ def create_list(payload: ShoppingListCreate, user_id: str = Depends(get_user_id)
             unit=unit,
             purchased=False
         ))
-
     db.commit()
     db.refresh(sl)
     _ = sl.items
@@ -381,14 +354,12 @@ def patch_item(item_id: int, payload: ItemPatch, user_id: str = Depends(get_user
     item = db.get(ShoppingListItem, item_id)
     if not item or item.list.user_id != user_id:
         raise HTTPException(status_code=404, detail="Item not found")
-
     if payload.quantity is not None:
         item.quantity = payload.quantity
     if payload.unit is not None:
         item.unit = payload.unit
     if payload.purchased is not None:
         item.purchased = payload.purchased
-
     db.commit()
     db.refresh(item)
     return item
@@ -402,18 +373,15 @@ def delete_item(item_id: int, user_id: str = Depends(get_user_id), db: Session =
     db.commit()
     return
 
-# -------------------- Bootstrap --------------------
+# -------------------- Bootstrap (startup) --------------------
 def seed_if_empty(db: Session):
-    # Seed groups/products if empty
     if db.execute(select(ProductGroup)).first():
         return
-
     fruits = ProductGroup(name="Fruits")
     dairy = ProductGroup(name="Dairy")
     bakery = ProductGroup(name="Bakery")
     db.add_all([fruits, dairy, bakery])
     db.flush()
-
     products = [
         Product(group_id=fruits.id, name="Apple", description="Fresh red apples", default_unit="pcs"),
         Product(group_id=fruits.id, name="Banana", description="Ripe bananas", default_unit="pcs"),
@@ -424,9 +392,17 @@ def seed_if_empty(db: Session):
     db.add_all(products)
     db.commit()
 
-Base.metadata.create_all(engine)
-with SessionLocal() as _db:
-    seed_if_empty(_db)
+@app.on_event("startup")
+def _startup():
+    Base.metadata.create_all(engine)
+    with SessionLocal() as _db:
+        seed_if_empty(_db)
 
-# Run local:
-# uvicorn main:app --reload
+# -------------------- Health & Root --------------------
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "shopping-backend"}
