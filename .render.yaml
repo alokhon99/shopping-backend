@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: shopping-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DB_URL
+        fromDatabase:
+          name: shopping-db
+          property: connectionString
+      - key: CORS_ORIGINS
+        value: https://<your-frontend-domain>
+databases:
+  - name: shopping-db
+    plan: free
