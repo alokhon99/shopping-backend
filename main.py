@@ -36,7 +36,7 @@ app = FastAPI(title="Shopping List Backend", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS or ["*"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -406,3 +406,4 @@ def healthz():
 @app.get("/")
 def root():
     return {"ok": True, "service": "shopping-backend"}
+
